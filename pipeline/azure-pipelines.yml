@@ -1,0 +1,137 @@
+# REVIEW: Consider restricting deployments to protected branches.
+trigger:
+  - '*'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  acrName: 'acrmyappprod'
+  acrLoginServer: 'acrmyappprod.azurecr.io'
+  acrUsername: 'acrmyappprod'
+
+  # SECURITY: Removed hardcoded ACR credential.
+  # Value should come from Azure DevOps secret variables.
+  acrPassword: $(acrPassword)
+
+  imageName: 'myapp-api'
+
+  # FIX: Use immutable image tags for traceability and rollback.
+  imageTag: '$(Build.BuildId)'
+
+  azureSubscription: 'Production-ServiceConnection'
+  resourceGroup: 'rg-myapp-prod'
+
+  # SECURITY: Removed hardcoded SQL password.
+  # Value should come from Azure DevOps secret variables.
+  sqlPassword: $(sqlPassword)
+
+  # SECURITY: Removed hardcoded Datadog API key.
+  # Value should come from Azure DevOps secret variables.
+  datadogApiKey: $(datadogApiKey)
+
+stages:
+  - stage: Build
+    displayName: 'Build and Push'
+
+    jobs:
+      - job: BuildJob
+        displayName: 'Build and Push Image'
+
+        steps:
+          - script: |
+              echo "Building Docker image..."
+              docker build -t $(acrLoginServer)/$(imageName):$(imageTag) .
+            displayName: 'Build Docker Image'
+
+          - script: |
+              echo "Logging into ACR..."
+
+              # SECURITY: Credentials should be supplied through secure pipeline variables.
+              docker login $(acrLoginServer) -u $(acrUsername) -p $(acrPassword)
+
+              echo "Pushing image..."
+              docker push $(acrLoginServer)/$(imageName):$(imageTag)
+            displayName: 'Push to ACR'
+
+  - stage: DeployNonprod
+    displayName: 'Deploy to Nonprod'
+    dependsOn: Build
+
+    jobs:
+      - job: TerraformPlanApplyNonprod
+        displayName: 'Terraform Plan & Apply - Nonprod'
+
+        steps:
+          - script: |
+              az login --service-principal -u $(servicePrincipalId) -p $(servicePrincipalKey) --tenant $(tenantId)
+            displayName: 'Azure Login'
+
+          - script: |
+              cd terraform
+
+              terraform init
+
+              # FIX: Verify Terraform formatting consistency.
+              terraform fmt -check
+
+              # FIX: Validate Terraform configuration before planning.
+              terraform validate
+
+              terraform plan -var-file="configuration/nonprod.tfvars" -var="image_tag=$(imageTag)" -out=nonprod.tfplan
+            displayName: 'Terraform Plan - Nonprod'
+
+          - script: |
+              cd terraform
+              terraform apply -auto-approve nonprod.tfplan
+            displayName: 'Terraform Apply - Nonprod'
+
+          - script: |
+              echo "Nonprod deployment complete!"
+              curl -s https://ca-myapp-api.azurecontainerapps.io/health || true
+            displayName: 'Verify Nonprod Deployment'
+
+  - stage: DeployProd
+    displayName: 'Deploy to Production'
+    dependsOn: DeployNonprod
+
+    jobs:
+      - job: TerraformPlanApplyProd
+        displayName: 'Terraform Plan & Apply - Production'
+
+        steps:
+          - script: |
+              az login --service-principal -u $(servicePrincipalId) -p $(servicePrincipalKey) --tenant $(tenantId)
+            displayName: 'Azure Login'
+
+          - script: |
+              cd terraform
+
+              terraform init
+
+              # FIX: Verify Terraform formatting consistency.
+              terraform fmt -check
+
+              # FIX: Validate Terraform configuration before planning.
+              terraform validate
+
+              terraform plan -var-file="configuration/prod.tfvars" -var="image_tag=$(imageTag)" -out=prod.tfplan
+            displayName: 'Terraform Plan - Production'
+
+          - script: |
+              cd terraform
+
+              # REVIEW: Production deployments should require approval gates.
+              terraform apply -auto-approve prod.tfplan
+            displayName: 'Terraform Apply - Production'
+
+          - script: |
+              echo "Production deployment complete!"
+              curl -s https://ca-myapp-api.azurecontainerapps.io/health || true
+            displayName: 'Verify Production Deployment'
+
+# REVIEW: Consider separating build, nonprod, and production deployments
+# into dedicated pipelines or deployment workflows for better isolation.
+
+# REVIEW: Consider adding Teams or email notifications
+# for successful production deployments.
